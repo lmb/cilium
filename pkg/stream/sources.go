@@ -5,6 +5,8 @@ package stream
 
 import (
 	"context"
+	"errors"
+	"sync"
 
 	"github.com/cilium/cilium/pkg/lock"
 )
@@ -216,4 +218,65 @@ func Multicast[T any](opts ...MulticastOpt) (mcast Observable[T], next func(T), 
 		})
 
 	return
+}
+
+// Unicast allows a single observer to subscribe to events.
+//
+// It has less overhead than [Multicast] for cases where fan-out is not required.
+type Unicast[T any] struct {
+	mu          sync.Mutex
+	ctx         context.Context
+	subNext     func(T)
+	subComplete func(error)
+}
+
+func (u *Unicast[T]) Observe(ctx context.Context, next func(T), complete func(error)) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.ctx != nil {
+		complete(errors.New("already being observed"))
+		return
+	}
+
+	u.ctx = ctx
+	u.subNext = next
+	u.subComplete = complete
+}
+
+func (u *Unicast[T]) Next(item T) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.ctx == nil {
+		return
+	}
+
+	select {
+	case <-u.ctx.Done():
+		u.subComplete(u.ctx.Err())
+		u.ctx, u.subNext, u.subComplete = nil, nil, nil
+		return
+	default:
+	}
+
+	u.subNext(item)
+}
+
+func (u *Unicast[T]) Complete(err error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.ctx == nil {
+		return
+	}
+
+	select {
+	case <-u.ctx.Done():
+		err = u.ctx.Err()
+	default:
+	}
+
+	u.subComplete(err)
+	u.ctx, u.subNext, u.subComplete = nil, nil, nil
 }
