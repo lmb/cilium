@@ -6,6 +6,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/netip"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/envoy"
 	"github.com/cilium/cilium/pkg/eventqueue"
+	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/labels"
@@ -31,18 +33,46 @@ import (
 	bpfIPCache "github.com/cilium/cilium/pkg/maps/ipcache"
 	"github.com/cilium/cilium/pkg/metrics"
 	monitorAPI "github.com/cilium/cilium/pkg/monitor/api"
+	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	policyAPI "github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/promise"
 	"github.com/cilium/cilium/pkg/safetime"
 	"github.com/cilium/cilium/pkg/trigger"
 )
 
-// initPolicy initializes the core policy components of the daemon.
-func (d *Daemon) initPolicy(
+func newPolicyRepository(
+	identityAllocatorPromise promise.Promise[cache.IdentityAllocator],
 	epMgr endpointmanager.EndpointManager,
 	certManager certificatemanager.CertificateManager,
 	secretManager certificatemanager.SecretManager,
+) (promise.Promise[*policy.Repository], promise.Promise[*policy.Updater]) {
+	repoPromise := promise.Map(
+		identityAllocatorPromise,
+		func(alloc cache.IdentityAllocator) (*policy.Repository, error) {
+			repo := policy.NewPolicyRepository(alloc,
+				alloc.GetIdentityCache(),
+				certManager,
+				secretManager,
+			)
+			repo.SetEnvoyRulesFunc(envoy.GetEnvoyHTTPRules)
+			return repo, nil
+		})
+	updaterPromise := promise.Map(
+		repoPromise,
+		func(repo *policy.Repository) (*policy.Updater, error) {
+			return policy.NewUpdater(repo, epMgr)
+		})
+
+	return repoPromise, updaterPromise
+}
+
+// initPolicy initializes the core policy components of the daemon.
+func (d *Daemon) initPolicy(
+	epMgr endpointmanager.EndpointManager,
+	policyRepoPromise promise.Promise[*policy.Repository],
+	policyUpdaterPromise promise.Promise[*policy.Updater],
 ) error {
 	// Reuse policy.TriggerMetrics and PolicyTriggerInterval here since
 	// this is only triggered by agent configuration changes for now and
@@ -58,18 +88,17 @@ func (d *Daemon) initPolicy(
 	}
 	d.datapathRegenTrigger = rt
 
-	d.policy = policy.NewPolicyRepository(d.identityAllocator,
-		d.identityAllocator.GetIdentityCache(),
-		certManager,
-		secretManager,
-	)
-	d.policy.SetEnvoyRulesFunc(envoy.GetEnvoyHTTPRules)
-	d.policyUpdater, err = policy.NewUpdater(d.policy, epMgr)
+	d.monitorAgent.RegisterNewConsumer(authMonitor.AddAuthManager(auth.NewAuthManager(epMgr)))
+
+	d.policy, err = policyRepoPromise.Await(d.ctx)
 	if err != nil {
-		return fmt.Errorf("failed to create policy update trigger: %w", err)
+		return err
 	}
 
-	d.monitorAgent.RegisterNewConsumer(authMonitor.AddAuthManager(auth.NewAuthManager(epMgr)))
+	d.policyUpdater, err = policyUpdaterPromise.Await(d.ctx)
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -80,17 +109,63 @@ func (d *Daemon) TriggerPolicyUpdates(force bool, reason string) {
 	d.policyUpdater.TriggerPolicyUpdates(force, reason)
 }
 
+type identityAllocatorOwner struct {
+	policy        *policy.Repository
+	policyUpdater *policy.Updater
+}
+
+func newCacheIdentityAllocatorOwner(
+	lc hive.Lifecycle,
+	policyPromise promise.Promise[*policy.Repository],
+	policyUpdaterPromise promise.Promise[*policy.Updater],
+) cache.IdentityAllocatorOwner {
+	owner := &identityAllocatorOwner{}
+	lc.Append(hive.Hook{
+		OnStart: func(ctx hive.HookContext) (err error) {
+			owner.policy, err = policyPromise.Await(ctx)
+			if err != nil {
+				return err
+			}
+			owner.policyUpdater, err = policyUpdaterPromise.Await(ctx)
+			if err != nil {
+				return err
+			}
+			return nil
+		},
+	})
+	return owner
+}
+
 // UpdateIdentities informs the policy package of all identity changes
 // and also triggers policy updates.
 //
 // The caller is responsible for making sure the same identity is not
 // present in both 'added' and 'deleted'.
-func (d *Daemon) UpdateIdentities(added, deleted cache.IdentityCache) {
+func (iao *identityAllocatorOwner) UpdateIdentities(added, deleted cache.IdentityCache) {
 	wg := &sync.WaitGroup{}
-	d.policy.GetSelectorCache().UpdateIdentities(added, deleted, wg)
+	iao.policy.GetSelectorCache().UpdateIdentities(added, deleted, wg)
 	// Wait for update propagation to endpoints before triggering policy updates
 	wg.Wait()
-	d.TriggerPolicyUpdates(false, "one or more identities created or deleted")
+	iao.policyUpdater.TriggerPolicyUpdates(false, "one or more identities created or deleted")
+}
+
+// GetNodeSuffix returns the suffix to be appended to kvstore keys of this
+// agent
+func (iao *identityAllocatorOwner) GetNodeSuffix() string {
+	var ip net.IP
+
+	switch {
+	case option.Config.EnableIPv4:
+		ip = node.GetIPv4()
+	case option.Config.EnableIPv6:
+		ip = node.GetIPv6()
+	}
+
+	if ip == nil {
+		log.Fatal("Node IP not available yet")
+	}
+
+	return ip.String()
 }
 
 // PolicyAddEvent is a wrapper around the parameters for policyAdd.
